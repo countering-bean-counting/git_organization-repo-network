@@ -159,7 +159,7 @@ get_gh_commits <- function (url, query) {
 }
 
 # get commits from the past 4 weeks
-commits_since <- today() - months(6)
+commits_since <- today() - weeks(4)
 
 org_repos <- read_rds("data/org_repos.Rds")
 org_commits <- data_frame()
@@ -201,13 +201,14 @@ org_commits_latest <- read_rds("data/org_commits_latest.Rds")
 
 committers <- org_commits_latest %>%
   group_by(company, committer.login) %>%
-  summarise(num_org_commits=n()) %>%
-  arrange(company, committer.login, -num_org_commits) %>%
-  slice(1:10)
+  summarise(num_org_commits=n())
 
 ggplot(committers, aes(x=company)) +
   geom_bar() +
-  coord_flip()
+  coord_flip() +
+  labs(x="Company", y="Count of Authors with Commits in the past Month on Company Repos")
+
+ggsave("num_recent_authors.png")
 
 ```
 
