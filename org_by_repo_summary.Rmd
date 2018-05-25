@@ -1,0 +1,338 @@
+---
+title: "Organization Commit Summaries"
+author: "Augustina Ragwitz"
+date: r! Sys.Date()
+params:
+  clearbit_api_key: !r Sys.getenv("API_KEY_CLEARBIT")
+  gh_id: !r Sys.getenv("API_KEY_GITHUB_ID")
+  gh_secret: !r Sys.getenv("API_KEY_GITHUB_SECRET")
+  gh_token: !r Sys.getenv("API_KEY_GITHUB_TOKEN")
+output:
+  html_document:
+    toc: TRUE
+---
+
+
+```{r includes, message=FALSE, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(gh)
+library(httr)
+library(jsonlite)
+library(lubridate)
+library(readr)
+library(stringr)
+library(tidyr)
+```
+
+# Overview
+
+Public commit activity can provide insight into open source contribution of activity among top technology companies with a Github presence. 
+
+## Methodology
+
+Given a list of companies of interest, identify author activity for recent committers on repositories in the official company Github organization. This excludes repositories and organizations owned by the author but does not exclude repositories belonging to organizations of which the author is a member. This only samples from committers from the past month. Repositories reported in the final results must show significant activity, either through number and consistency of commits by an author in the recent past or by the number of authors having commits on the project.
+
+### Assumptions
+
+ * The majority of committers on official company repositories were employees of the company at the time the commit was made.
+ * Significant activity from company-identified committers on other repositories is company-sanctioned.
+ 
+## Companies of Interest
+
+The following companies were identified as being of interest based on an internal report. I was not able to determine why these companies were chosen.
+
+ * Amazon
+ * Cisco
+ * Facebook
+ * Fujitsu
+ * Google
+ * Huawei
+ * IBM
+ * Microsoft
+ * Oracle
+ * Pivotal
+ * Redhat
+ 
+I've added the following companies to the report based on their activity in AI Open Source projects I analyze on a monthly basis.
+
+ * Apple
+ * Baidu
+ * Intel
+ * NVIDIA
+ * Samsung
+ 
+ 
+```{r companies}
+
+companies <- read_csv('
+Apple,apple
+Amazon.com,amzn
+Baidu,baidu
+Cisco,cisco
+Facebook,facebook
+Fujitsu,fujitsu
+Google,google
+Huawei,huawei
+IBM,ibm
+Intel,intel
+Microsoft,microsoft
+NVIDIA,nvidia
+Oracle,oracle
+Pivotal,pivotal-cf
+Redhat,rht-labs
+Redhat,redhat-openstack
+Redhat,redhat-developer
+Samsung,samsung
+', col_names=c("name","github_org"))
+
+```
+
+# Data Collection
+
+## Github Commits
+
+The following functions use the Github API to identify contributors for companies of interest. Official company repositories were looked up manually and provided in the companies data structure defined above. 
+
+### Github API Base Functions
+
+```{r github_api_functions}
+
+query_params <- list(
+  client_id=params$gh_id, 
+  client_secret=params$gh_secret)
+
+get_gh_resp <- function (url, query) {
+  req <- GET(url, query=query)
+  print(paste(req$url))
+  json <- content(req, as = "text")
+  resp <- fromJSON(json, flatten = TRUE)
+  #resp_df <-  resp %>% unlist() %>% as.data.frame.list()
+  return(resp)
+}
+```
+
+### Latest Active Repositories per Organization
+
+The following functions query the Github API to return a list of the most recently updated repositories for each Github organization.
+
+```{r github_api_org_repos, eval=FALSE}
+# get repos updated in the last month for an organization
+
+get_gh_org_repos <- function (org, url, query) {
+  org_url <- str_replace(url, ":org", org)
+  sha_resp <- get_gh_resp(org_url, query)
+}
+
+orgs_url <- "https://api.github.com/orgs/:org/repos"
+
+org_repos = data_frame()
+for (n in 1:nrow(companies)) {
+  org <- companies$github_org[n]
+  org_resp <- get_gh_org_repos(org, orgs_url, query_params)
+  
+  # add the github org and company name for reference
+  org_resp <- org_resp %>% 
+    mutate(company=companies$name[n], github_org=org)
+  
+  org_repos <- bind_rows(org_resp, org_repos)
+}
+
+write_rds(org_repos, "data/org_repos.Rds")
+
+```
+
+### Latest Commits on Organization Repositories
+
+The following functions query the Github API to return the latest commits on the most recently updated repositories for each company.
+
+```{r github_api_latest_commits, eval=FALSE}
+
+get_gh_commits <- function (url, query) {
+  req <- GET(url, query=query, accept("application/vnd.github.cloak-preview"))
+  print(paste(req$url))
+  json <- content(req, as = "text")
+  resp <- fromJSON(json, flatten = TRUE)
+  #resp_df <-  resp %>% unlist() %>% as.data.frame.list()
+  return(resp)
+}
+
+# get commits from the past 4 weeks
+commits_since <- today() - months(6)
+
+org_repos <- read_rds("data/org_repos.Rds")
+org_commits <- data_frame()
+
+for (n in 1:nrow(org_repos)) {
+  commits_url <- str_replace(org_repos$commits_url[n], "\\{/sha\\}", "")
+  org_commits_resp <- get_gh_commits(commits_url, query_params)
+  
+  if (!is.data.frame(org_commits_resp)) {
+    paste(org_commits_resp$message)
+    next()
+  }
+  
+  # add the github org and company name for reference
+  org_commits_resp <- org_commits_resp %>% 
+    mutate(company=org_repos$company[n], github_org=org_repos$github_org[n], repo=org_commits_resp$org_repos)
+  
+  org_commits <- bind_rows(org_commits, org_commits_resp)
+}
+
+write_rds(org_commits, "data/org_commits.Rds")
+
+# filter out commits before target date
+
+org_commits_latest <- org_commits %>%
+  filter(commit.committer.date > commits_since)
+
+write_rds(org_commits_latest, "data/org_commits_latest.Rds")
+
+```
+
+### Affliated Authors
+
+The following functions create a list of authors based on the committer information in commits pulled from the organization repositories with github user information pulled from the Github API.
+
+```{r github_api_affiliated_authors}
+
+org_commits_latest <- read_rds("data/org_commits_latest.Rds")
+
+committers <- org_commits_latest %>%
+  group_by(company, committer.login) %>%
+  summarise(num_org_commits=n()) %>%
+  arrange(company, committer.login, -num_org_commits) %>%
+  slice(1:10)
+
+ggplot(committers, aes(x=company)) +
+  geom_bar() +
+  coord_flip()
+
+```
+
+### Affiliated Authors Commits
+
+The following function uses the Github API to look up commits belonging to the authors identified from the organizations' commits. Repositories belonging to the author are excluded.
+
+```{r github_api_affiliated_commits}
+search_gh_commits_by_login <- function(search_fields, query_params) {
+  commits_search_url <- "https://api.github.com/search/commits?q="
+  #commits_search_author_date <- "author-date:>2018-03-01" # today - 1 month, ymd
+  commits_search_author <- paste("author", search_fields$login, sep=":") # TODO author vs committer
+  #commits_search_repo_not_user <- paste0("-", "user:", search_fields$login) 
+  # TODO commits_search_repo_not_org <- paste0(-org:orgname)
+  
+  commits_search_query <- paste(commits_search_author, sep="+")
+  commits_search_url <- paste(commits_search_url, commits_search_query, sep="")
+  print(commits_search_url)
+  
+  commits_resp <- get_gh_commits(commits_search_url, query_params)
+  return(commits_resp)
+}
+
+```
+
+
+```{r fetch_github_commits_per_user}
+
+github_users <- read_rds("github_users.Rds")
+
+affiliated_commits <- data_frame()
+for (n in 10:nrow(github_users)) {
+  commits <- search_gh_commits_by_login(github_users %>% slice(n), query_params)
+  
+  if(length(commits) == 0) {
+    commits <- data_frame()
+  }
+  
+  commits <- commits %>% mutate(login=github_users$login[n])
+  affiliated_commits <- bind_rows(affiliated_commits, commits)
+}
+
+write_rds(affiliated_commits, "affiliated_commits.Rds")
+
+```
+
+### Affiliated Authors Events
+
+The following function uses the Github Archive to look up commits belonging to the authors identified from the organizations' commits.
+
+```{r github_archive_affiliated_events}
+
+```
+
+
+# Analysis
+
+## Project Demographics
+
+### Language
+
+### Committer Diversity
+
+### Maturity
+
+### Type
+
+## Significant Commit Activity
+
+Based on the commit log, what significant activity do we see from the committers?
+
+```{r significant_commits_summary}
+
+# proportion of org-owned repository activity vs non-org owned
+
+# top significant repos per org if a huge list
+
+```
+
+
+### Individual Authors
+
+Significance is defined by a large number of commits to a particular project.
+
+```{r significant_commits_author}
+
+```
+
+
+### Multiple Authors (Same Company)
+
+Significance is defined as the presence of multiple authors from the same company.
+
+```{r significant_commits_multi_authors}
+
+```
+
+### Multiple Companies
+
+Significance is defined as the presence of commits from multiple companies.
+
+```{r significant_commits_multi_company}
+
+```
+
+## Significant Event Activity
+
+```{r significant_events}
+
+# proportion of org-owned repository activity vs non-org owned
+
+# top significant repos per org if a huge list
+
+```
+
+### Multiple Companies
+
+Significance is defined as the presence of commits from multiple companies.
+
+```{r significant_commits_multi_company}
+
+```
+
+
+# Summary
+
+
+

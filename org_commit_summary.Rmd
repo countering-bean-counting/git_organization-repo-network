@@ -1,0 +1,316 @@
+---
+title: "Organization Commit Summaries"
+author: "Augustina Ragwitz"
+date: r! Sys.Date()
+params:
+  clearbit_api_key: !r Sys.getenv("API_KEY_CLEARBIT")
+  gitlog_rds: !r paste(here::here(), "..", "git-commit-log-engagement", "deep-learning-frameworks-commit-log", "data", "dl-frameworks-commit-log_domain_info.Rds", sep="/")
+  gh_id: !r Sys.getenv("API_KEY_GITHUB_ID")
+  gh_secret: !r Sys.getenv("API_KEY_GITHUB_SECRET")
+  gh_token: !r Sys.getenv("API_KEY_GITHUB_TOKEN")
+output:
+  html_document:
+    toc: TRUE
+---
+
+
+```{r includes, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(gh)
+library(httr)
+library(jsonlite)
+library(lubridate)
+library(readr)
+library(stringr)
+library(tidyr)
+```
+
+
+```{r github_api_functions}
+
+query_params <- list(
+  client_id=params$gh_id, 
+  client_secret=params$gh_secret, 
+  per_page=100)
+
+get_gh_resp <- function (url, query) {
+  req <- GET(url, query=query)
+  print(paste(req$url))
+  json <- content(req, as = "text")
+  resp <- fromJSON(json, flatten = TRUE)
+  resp_df <-  resp %>% unlist() %>% as.data.frame.list()
+  return(resp_df)
+}
+
+get_gh_commits <- function (url, query) {
+  req <- GET(url, query=append(query, c(sort="author-date", order="desc")), accept("application/vnd.github.cloak-preview"))
+  print(paste(req$url))
+  json <- content(req, as = "text")
+  resp <- fromJSON(json, flatten = TRUE)
+  #resp_df <-  resp %>% unlist() %>% as.data.frame.list()
+  return(resp$items)
+}
+
+search_gh_commits_by_login <- function(search_fields, query_params) {
+  commits_search_url <- "https://api.github.com/search/commits?q="
+  #commits_search_author_date <- "author-date:>2018-03-01" # today - 1 month, ymd
+  commits_search_author <- paste("author", search_fields$login, sep=":") # TODO author vs committer
+  #commits_search_repo_not_user <- paste0("-", "user:", search_fields$login) 
+  # TODO commits_search_repo_not_org <- paste0(-org:orgname)
+  
+  commits_search_query <- paste(commits_search_author, sep="+")
+  commits_search_url <- paste(commits_search_url, commits_search_query, sep="")
+  print(commits_search_url)
+  
+  commits_resp <- get_gh_commits(commits_search_url, query_params)
+  return(commits_resp)
+}
+
+```
+
+
+Based on the commit log (this month -- will expand in future), what else are affiliated contributors committing to?
+
+```{r get_org_contributors}
+
+# read in the commit log
+gitlogs <- read_rds(params$gitlog_rds)
+
+# limit to past 6 months to make sure employment is current
+gitlogs <- gitlogs %>% filter(commit_date > (as.Date(Sys.Date()) - months(6)))
+
+# summarize company affiliation by author
+# public company affiliation
+authors_public <- gitlogs %>%
+  group_by(author_group) %>%
+  mutate(has_public = any(author_company_type %in% c("public"))) %>%
+  filter(has_public) %>%
+  select(author_name, author_email, sha, author_domain_group, author_company_name, author_company_type, commit_date, repo) %>%
+  mutate(contributor_type="author") %>%
+  rename(name=author_name, email=author_email, network=author_group, domain_group=author_domain_group, company_name=author_company_name, company_type=author_company_type)
+
+committers_public <- gitlogs %>%
+  group_by(committer_group) %>%
+  mutate(has_public = any(committer_company_type %in% c("public"))) %>%
+  filter(has_public) %>%
+  select(committer_name, committer_email, sha, committer_domain_group, committer_company_name, committer_company_type, commit_date, repo) %>%
+  mutate(contributor_type="committer") %>%
+  rename(name=committer_name, email=committer_email, network=committer_group, domain_group=committer_domain_group, company_name=committer_company_name, company_type=committer_company_type)
+
+contributors_public <- bind_rows(authors_public, committers_public)
+
+# can't get this to work properly in dplyr so hacking it here
+public_companies <- unique(contributors_public$company_name[which(contributors_public$company_type %in% c("public"))])
+
+contributors_public_by_company <- contributors_public %>%
+  mutate(company = public_companies[match(company_name, public_companies)]) %>%
+  group_by(company, network) %>%
+  summarise() %>%
+  unique() %>%
+  filter(!is.na(company)) %>%
+  right_join(contributors_public)
+  
+# add the month
+contributors_public_by_company <- contributors_public %>% 
+  select(sha, commit_date, contributor_type, repo) %>%
+  right_join(contributors_public_by_company)
+
+# filter out dupes (people with 2 companies) for now
+contributors_public_by_company <- contributors_public_by_company %>%
+  group_by(network) %>%
+  mutate(num_companies = n_distinct(company)) %>%
+  filter(num_companies == 1) %>%
+  select(-num_companies)
+
+## TODO add companies Jim is asking for
+```
+
+
+Collect a list of contributors from different companies so we can look up their commits. This selects 20 commits at random associated with a company - some companies have a lot, others have less. Future work will be more comprehensive.
+
+```{r companies}
+
+# which ones did we identify the most contributors for?
+companies_top_contributors <- contributors_public_by_company %>%
+  group_by(company) %>%
+  summarise(total_authors=n_distinct(network)) %>%
+  filter(total_authors > 1)
+
+# join on company
+companies_top_contributors <- contributors_public_by_company %>%
+  select(network, company) %>%
+  inner_join(companies_top_contributors) %>% unique()
+
+# if total authors > 20, select 20 at random
+fetch_github_users <- companies_top_contributors %>% 
+  group_by(company) %>% 
+  sample_n(20, replace=TRUE)
+
+# get latest sha
+fetch_github_users <- fetch_github_users %>%
+  inner_join(contributors_public_by_company %>% select(company, network, sha, repo, contributor_type, commit_date))
+
+fetch_github_users <- fetch_github_users %>%
+  group_by(company, network) %>%
+  slice(which.max(commit_date))
+
+write_rds(fetch_github_users, "fetch_github_users.Rds")
+```
+
+Get the Github user login for the author and committer on each commit.
+
+```{r fetch_github_login}
+
+fetch_github_users <- read_rds("fetch_github_users.Rds")
+
+shas_url <- "https://api.github.com/repos/:repo/commits/:sha"
+shas = data_frame()
+for (n in 1:nrow(fetch_github_users)) {
+  sha_url <- str_replace(shas_url, ":repo", fetch_github_users$repo[n])
+  sha_url <- str_replace(sha_url, ":sha", fetch_github_users$sha[n])
+  sha_resp <- get_gh_resp(sha_url, query_params)
+  shas <- bind_rows(sha_resp, shas)
+}
+
+fetch_github_users <- fetch_github_users %>% inner_join(shas)
+write_rds(fetch_github_users, "fetch_github_users.Rds")
+
+# extract login + network
+github_logins <- fetch_github_users %>%
+  select(network, repo, company, author.login, committer.login, contributor_type) %>%
+  gather(login_type, login, author.login:committer.login) %>%
+  mutate(login_type=str_replace(login_type, ".login", ""))
+
+write_rds(github_logins, "github_logins.Rds")
+
+```
+
+```{r fetch_github_user_profile}
+github_logins <- read_rds("github_logins.Rds")
+github_logins_only <- github_logins %>% ungroup() %>% filter(! is.na(login)) %>% select(login) %>% unique()
+
+# request to gh api
+users_url <- "https://api.github.com/users/:username"
+users = data_frame()
+for (n in 1:nrow(github_logins_only)) {
+  user_url <- str_replace(users_url, ":username", github_logins_only$login[n])
+  print(paste(user_url))
+  user_resp <- get_gh_resp(user_url, query_params)
+  users <- bind_rows(user_resp, users)
+}
+
+github_logins <- github_logins %>% left_join(users %>% rename(company_gh = company), by="login")
+write_rds(users, "github_users.Rds")
+
+```
+
+
+```{r fetch_github_commits_per_user}
+
+github_users <- read_rds("github_users.Rds")
+
+affiliated_commits <- data_frame()
+for (n in 10:nrow(github_users)) {
+  commits <- search_gh_commits_by_login(github_users %>% slice(n), query_params)
+  
+  if(length(commits) == 0) {
+    commits <- data_frame()
+  }
+  
+  commits <- commits %>% mutate(login=github_users$login[n])
+  affiliated_commits <- bind_rows(affiliated_commits, commits)
+}
+
+write_rds(affiliated_commits, "affiliated_commits.Rds")
+
+```
+
+Summarize the commits retrieved
+
+```{r summarize_commits}
+
+affiliated_commits <- read_rds("affiliated_commits.Rds")
+
+# filter where login owns the repo
+affiliated_commits_summary <- affiliated_commits %>%
+  filter(login != repository.owner.login) %>%
+  group_by(login, repository.full_name) %>%
+  summarise() %>%
+  separate(repository.full_name, c("org", "repo"), sep="/")
+
+# join with company data
+github_logins <- read_rds("github_logins.Rds")
+affiliated_commits_summary <- affiliated_commits_summary %>%
+  inner_join(github_logins %>% rename(original_repo=repo), by="login")
+
+# summarize by company
+affiliated_commits_company_summary <- affiliated_commits_summary %>%
+  group_by(org) %>%
+  mutate(num_org_companies=n_distinct(company)) %>%
+  group_by(org, repo) %>%
+  mutate(num_repo_companies=n_distinct(company)) %>%
+  group_by(company, org, repo) %>%
+  summarise(num_org_companies=first(num_org_companies),
+            num_repo_companies=first(num_repo_companies),
+            has_commit=1)
+  
+```
+
+All Github org commits in the user sample for each company.
+
+```{r affliated_orgs_per_company, fig.height=15, fig.width=10}
+
+ggplot(affiliated_commits_company_summary, aes(x=org)) +
+  geom_bar(aes(fill=company), position="stack") +
+  coord_flip() +
+  facet_wrap(~ company, scales="free")
+
+
+ggplot(affiliated_commits_company_summary %>% filter(company=="Google"), aes(x=org)) +
+  geom_bar(aes(fill=company), position="stack") +
+  coord_flip()
+
+ggplot(affiliated_commits_company_summary %>% filter(company=="NVIDIA"), aes(x=org)) +
+  geom_bar(aes(fill=company), position="stack") +
+  coord_flip()
+
+ggplot(affiliated_commits_company_summary %>% filter(company=="Samsung"), aes(x=org)) +
+  geom_bar(aes(fill=company), position="stack") +
+  coord_flip()
+```
+
+```{r multi_company_orgs, fig.height=12, fig.width=10}
+
+ggplot(affiliated_commits_company_summary %>% filter(num_org_companies > 1), aes(x=reorder(org, num_org_companies))) +
+  geom_bar(aes(fill=company), position="dodge") +
+  coord_flip()
+
+```
+
+```{r multi_company_repos, fig.height=30, fig.width=25}
+affiliated_commits_org_company_summary <- affiliated_commits_company_summary %>%
+  group_by(org, repo, company) %>%
+  summarise(num_org_companies=first(num_org_companies), num_repo_companies=first(num_repo_companies))
+
+ggplot(affiliated_commits_org_company_summary %>% filter(num_org_companies > 3), 
+       aes(x=repo, y="TRUE")) +
+  geom_bar(aes(fill=company), position="dodge", stat="identity") +
+  theme(axis.text.y=element_blank()) +
+  coord_flip() +
+  facet_wrap(~ org, scales="free", ncol=6) +
+  theme_few() +
+  labs(x="repo", y="", fill="Company") 
+
+ggsave("affliated_commits_org_company_summary.png")
+
+```
+
+
+
+
+
+
+
+
