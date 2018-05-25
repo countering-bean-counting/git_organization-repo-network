@@ -66,19 +66,62 @@ I've added the following companies to the report based on their activity in AI O
  
 ```{r companies}
 
+# TODO: This description needs to go into overview
+
+# Organizations were found using the following search terms: <company name> github organization
+# Organizations were manually verified
+# Any listed as a "foundation" or lacking a company logo or company website url were excluded.
+
+# TODO: cite these as sources/footnotes
+
+# https://github.com/collections/open-source-organizations
+
+# Intel - https://software.intel.com/en-us/code-samples/github
+# Microsoft - https://opensource.microsoft.com/
+# Amazon - https://amzn.github.io/
+
 companies <- read_csv('
 Apple,apple
 Amazon.com,amzn
+Amazon.com,alexa
+Amazon.com,aws
+Amazon.com,awslabs
 Baidu,baidu
+Baidu,ecomfe
+Baidu,baidu-research
+Baidu,baidu-aip
+Baidu,fex-team
 Cisco,cisco
+Cisco,ciscodevnet
 Facebook,facebook
 Fujitsu,fujitsu
 Google,google
+Google,googlesamples
+Google,googlecloudplatform
 Huawei,huawei
+Huawei,liteos
+Huawei,huaweibigdata
+Huawei,huaweicloud
+Huawei,huawei-clouds
 IBM,ibm
+IBM,ibm-cloud
+IBM,ibmresearch
+IBM,ibmdatascience
+IBM,ibm-watson-iot
+IBM,watson-explorer
+IBM,watson-developer-cloud
 Intel,intel
+Intel,01org
+Intel,intellabs
+Intel,intel-bigdata
+Intel,intel-cloud
 Microsoft,microsoft
+Microsoft,azure
+Microsoft,aspnet
+Microsoft,powershell
 NVIDIA,nvidia
+NVIDIA,nvidiagameworks
+NVIDIA,nvlabs
 Oracle,oracle
 Pivotal,pivotal-cf
 Redhat,rht-labs
@@ -105,7 +148,6 @@ query_params <- list(
 
 get_gh_resp <- function (url, query) {
   req <- GET(url, query=query)
-  print(paste(req$url))
   json <- content(req, as = "text")
   resp <- fromJSON(json, flatten = TRUE)
   #resp_df <-  resp %>% unlist() %>% as.data.frame.list()
@@ -132,6 +174,11 @@ for (n in 1:nrow(companies)) {
   org <- companies$github_org[n]
   org_resp <- get_gh_org_repos(org, orgs_url, query_params)
   
+  if (!is.data.frame(org_resp)) {
+    print(paste(org, org_resp$message))
+    next()
+  }
+  
   # add the github org and company name for reference
   org_resp <- org_resp %>% 
     mutate(company=companies$name[n], github_org=org)
@@ -151,15 +198,11 @@ The following functions query the Github API to return the latest commits on the
 
 get_gh_commits <- function (url, query) {
   req <- GET(url, query=query, accept("application/vnd.github.cloak-preview"))
-  print(paste(req$url))
   json <- content(req, as = "text")
   resp <- fromJSON(json, flatten = TRUE)
   #resp_df <-  resp %>% unlist() %>% as.data.frame.list()
   return(resp)
 }
-
-# get commits from the past 4 weeks
-commits_since <- today() - weeks(4)
 
 org_repos <- read_rds("data/org_repos.Rds")
 org_commits <- data_frame()
@@ -169,20 +212,21 @@ for (n in 1:nrow(org_repos)) {
   org_commits_resp <- get_gh_commits(commits_url, query_params)
   
   if (!is.data.frame(org_commits_resp)) {
-    paste(org_commits_resp$message)
+    print(paste(org_repos$full_name[n], org_commits_resp$message))
     next()
   }
   
   # add the github org and company name for reference
   org_commits_resp <- org_commits_resp %>% 
-    mutate(company=org_repos$company[n], github_org=org_repos$github_org[n], repo=org_commits_resp$org_repos)
+    mutate(company=org_repos$company[n], github_org=org_repos$github_org[n], repo=org_repos$full_name[n])
   
   org_commits <- bind_rows(org_commits, org_commits_resp)
 }
 
 write_rds(org_commits, "data/org_commits.Rds")
 
-# filter out commits before target date
+# get commits from the past 4 weeks
+commits_since <- today() - weeks(4)
 
 org_commits_latest <- org_commits %>%
   filter(commit.committer.date > commits_since)
@@ -195,21 +239,77 @@ write_rds(org_commits_latest, "data/org_commits_latest.Rds")
 
 The following functions create a list of authors based on the committer information in commits pulled from the organization repositories with github user information pulled from the Github API.
 
-```{r github_api_affiliated_authors}
+```{r github_api_affiliated_authors, eval=FALSE}
 
 org_commits_latest <- read_rds("data/org_commits_latest.Rds")
 
 committers <- org_commits_latest %>%
+  group_by(company) %>%
+  mutate(num_orgs = n_distinct(github_org),
+         num_repos = n_distinct(repo)) %>%
   group_by(company, committer.login) %>%
-  summarise(num_org_commits=n())
+  summarise(num_org_commits=n(), num_orgs=first(num_orgs), num_repos=first(num_repos))
 
+write_rds(committers, "data/committers.Rds")
+write_csv(committers, "data/committers.csv")
+```
+
+The following plot shows the distribution of the number of authors
+
+```{r fig-github_api_affiliated_authors}
+
+# Plot distribution of authors per company
 ggplot(committers, aes(x=company)) +
-  geom_bar() +
+  geom_bar(aes(fill=factor(num_orgs))) +
   coord_flip() +
-  labs(x="Company", y="Count of Authors with Commits in the past Month on Company Repos")
+  labs(title="Distribution of Authors",
+       x="Company", 
+       y="Count of Committers active in the past Month on Company-owned Repos", 
+       fill="# Github Orgs")
 
-ggsave("num_recent_authors.png")
+```
 
+
+### Affiliated Authors Sample
+
+Cluster committers by company and take a random sample of 10 committers identified per company. If a company has less than 10, use all of the ones we identified.
+
+```{r affiliated_authors_sample, eval=FALSE}
+
+committers <- read_rds("data/committers.Rds")
+
+committers_sample_base <- committers %>%
+  filter(! is.na(committer.login) & ! committer.login %in% c("web-flow")) %>%
+  group_by(company) %>%
+  mutate(num_committers = n_distinct(committer.login))
+
+committers_less_than_sample_size <- committers_sample_base %>%
+  filter(num_committers < 10)
+
+committers_sample <- committers_sample_base %>%
+  filter(num_committers >= 10) %>%
+  sample_n(10)
+
+committers_sample <- bind_rows(committers_sample, committers_less_than_sample_size)
+
+# add org info
+org_commits_latest <- read_rds("data/org_commits_latest.Rds")
+committers_sample <- committers_sample %>% 
+  inner_join(org_commits_latest %>% select(committer.login, github_org)) %>%
+  unique()
+
+write_rds(committers_sample, "data/committers_sample.Rds")
+write_csv(committers_sample, "data/committers_sample.csv")
+```
+
+```{r fig-affiliated_authors_sample}
+# Plot distribution of committers per company
+ggplot(committers_sample, aes(x=company)) +
+  geom_bar(aes(fill=num_committers < 10)) +
+  coord_flip() +
+  labs(title="Author Sample Size Distribution",
+       x="Company", 
+       y="Author Sample Size per Company")
 ```
 
 ### Affiliated Authors Commits
@@ -217,47 +317,43 @@ ggsave("num_recent_authors.png")
 The following function uses the Github API to look up commits belonging to the authors identified from the organizations' commits. Repositories belonging to the author are excluded.
 
 ```{r github_api_affiliated_commits}
-search_gh_commits_by_login <- function(search_fields, query_params) {
+
+search_gh_commits_by_login <- function(login, orgname, query_params) {
   commits_search_url <- "https://api.github.com/search/commits?q="
-  #commits_search_author_date <- "author-date:>2018-03-01" # today - 1 month, ymd
-  commits_search_author <- paste("author", search_fields$login, sep=":") # TODO author vs committer
-  #commits_search_repo_not_user <- paste0("-", "user:", search_fields$login) 
-  # TODO commits_search_repo_not_org <- paste0(-org:orgname)
+  
+  commits_search_author <- paste("author", login, sep=":")
+  commits_search_date <- paste("author-date", ">2018-04-01", sep=":")
   
   commits_search_query <- paste(commits_search_author, sep="+")
   commits_search_url <- paste(commits_search_url, commits_search_query, sep="")
   print(commits_search_url)
   
-  commits_resp <- get_gh_commits(commits_search_url, query_params)
-  return(commits_resp)
+  commits_resp <- get_gh_commits(commits_search_url, append(query_params, c(per_page=100)))
+  return(commits_resp$items)
 }
 
-```
-
-
-```{r fetch_github_commits_per_user}
-
-github_users <- read_rds("github_users.Rds")
+committers_sample <- read_rds("data/committers_sample.Rds")
 
 affiliated_commits <- data_frame()
-for (n in 10:nrow(github_users)) {
-  commits <- search_gh_commits_by_login(github_users %>% slice(n), query_params)
+for (n in 1:nrow(committers_sample)) {
+  commits <- search_gh_commits_by_login(committers_sample$committer.login[n], committers_sample$github_org[n], query_params)
   
   if(length(commits) == 0) {
     commits <- data_frame()
   }
   
-  commits <- commits %>% mutate(login=github_users$login[n])
+  commits <- commits %>% mutate(login=committers_sample$committer.login[n], company=committers_sample$company[n])
   affiliated_commits <- bind_rows(affiliated_commits, commits)
 }
 
-write_rds(affiliated_commits, "affiliated_commits.Rds")
+write_rds(affiliated_commits, "data/affiliated_commits.Rds")
 
 ```
 
+
 ### Affiliated Authors Events
 
-The following function uses the Github Archive to look up commits belonging to the authors identified from the organizations' commits.
+The following function uses the Github Archive to look up events belonging to the authors identified from the organizations' commits.
 
 ```{r github_archive_affiliated_events}
 
@@ -326,7 +422,7 @@ Significance is defined as the presence of commits from multiple companies.
 
 ### Multiple Companies
 
-Significance is defined as the presence of commits from multiple companies.
+Significance is defined as the presence of events from multiple companies.
 
 ```{r significant_commits_multi_company}
 
