@@ -257,6 +257,7 @@ write_csv(committers, "data/committers.csv")
 The following plot shows the distribution of the number of authors
 
 ```{r fig-github_api_affiliated_authors}
+committers <- read_rds("data/committers.Rds")
 
 # Plot distribution of authors per company
 ggplot(committers, aes(x=company)) +
@@ -303,6 +304,8 @@ write_csv(committers_sample, "data/committers_sample.csv")
 ```
 
 ```{r fig-affiliated_authors_sample}
+
+committers_sample <- read_rds("data/committers_sample.Rds")
 # Plot distribution of committers per company
 ggplot(committers_sample, aes(x=company)) +
   geom_bar(aes(fill=num_committers < 10)) +
@@ -316,7 +319,15 @@ ggplot(committers_sample, aes(x=company)) +
 
 The following function uses the Github API to look up commits belonging to the authors identified from the organizations' commits. Repositories belonging to the author are excluded.
 
-```{r github_api_affiliated_commits}
+```{r github_api_affiliated_commits, eval=FALSE}
+
+get_gh_commits <- function (url, query) {
+  req <- GET(url, query=query, accept("application/vnd.github.cloak-preview"))
+  json <- content(req, as = "text")
+  resp <- fromJSON(json, flatten = TRUE)
+  #resp_df <-  resp %>% unlist() %>% as.data.frame.list()
+  return(resp)
+}
 
 search_gh_commits_by_login <- function(login, orgname, query_params) {
   commits_search_url <- "https://api.github.com/search/commits?q="
@@ -329,26 +340,55 @@ search_gh_commits_by_login <- function(login, orgname, query_params) {
   print(commits_search_url)
   
   commits_resp <- get_gh_commits(commits_search_url, append(query_params, c(per_page=100)))
-  return(commits_resp$items)
+  return(commits_resp)
 }
 
 committers_sample <- read_rds("data/committers_sample.Rds")
 
 affiliated_commits <- data_frame()
 for (n in 1:nrow(committers_sample)) {
-  commits <- search_gh_commits_by_login(committers_sample$committer.login[n], committers_sample$github_org[n], query_params)
+  print(paste(committers_sample$company[n], committers_sample$committer.login[n]))
   
-  if(length(commits) == 0) {
-    commits <- data_frame()
+  # Github API rate limits Search requests to 30 per minute
+  if(n %% 30 == 0) {
+    print(paste(n, "Rate Limit Nap"))
+    Sys.sleep(60)
   }
+
+  commits_resp <- search_gh_commits_by_login(
+    committers_sample$committer.login[n], 
+    committers_sample$github_org[n], 
+    query_params)
   
-  commits <- commits %>% mutate(login=committers_sample$committer.login[n], company=committers_sample$company[n])
+  commits <- commits_resp$items
+  
+  commits <- commits %>% 
+    mutate(login=committers_sample$committer.login[n], 
+           company=committers_sample$company[n],
+           github_org=committers_sample$github_org[n])
+
   affiliated_commits <- bind_rows(affiliated_commits, commits)
 }
 
 write_rds(affiliated_commits, "data/affiliated_commits.Rds")
+write_csv(affiliated_commits %>% select(-parents), "data/affiliated_commits.csv")
 
 ```
+
+```{r affiliated_commits_summary, eval=FALSE}
+
+affiliated_commits <- read_rds("data/affiliated_commits.Rds")
+
+affiliated_commits_summary <- affiliated_commits %>%
+  filter(login == author.login) %>%
+  group_by(company, repository.full_name) %>%
+  summarise(num_authors=n_distinct(login), num_commits=n())
+
+write_rds(affiliated_commits_summary, "data/affiliated_commits_summary.Rds")
+write_csv(affiliated_commits_summary, "data/affiliated_commits_summary.csv")
+
+```
+
 
 
 ### Affiliated Authors Events
@@ -378,11 +418,91 @@ Based on the commit log, what significant activity do we see from the committers
 
 ```{r significant_commits_summary}
 
-# proportion of org-owned repository activity vs non-org owned
+affiliated_commits_summary <- read_rds("data/affiliated_commits_summary.Rds")
 
-# top significant repos per org if a huge list
+affiliated_commits_summary <- affiliated_commits_summary %>%
+  separate(repository.full_name, c("org", "repo"), sep="/", remove=FALSE)
+
+affiliated_commits_summary <- affiliated_commits_summary %>%
+  mutate(org=str_to_lower(org)) %>%
+  left_join(companies %>% rename(org_company=name, org=github_org))
+
+affiliated_commits_summary <- affiliated_commits_summary %>%
+  mutate(owned_repo = company == org_company,
+         owned_repo = ifelse(is.na(owned_repo), FALSE, owned_repo))
+
+owned_org_summary <- affiliated_commits_summary %>%
+  group_by(company, org) %>%
+  summarise(
+    owned_repo=first(owned_repo),
+    total_commits=sum(num_commits),
+    total_authors=sum(num_authors),
+    num_repos=n_distinct(repository.full_name)
+  )
+```
+
+```{r fig-org-owned_repos}
+# proportion of org-owned repository activity vs non-org owned
+ggplot(owned_org_summary, aes(x=company, y=num_repos, fill=owned_repo)) +
+  geom_bar(stat="identity") +
+  coord_flip()
 
 ```
+
+```{r fig-top-orgs-commits, fig.height=16, fig.width=10}
+
+# top significant repos per org if a huge list
+ggplot(owned_org_summary %>% 
+         filter(total_commits > 1, total_authors > 1) %>% 
+         group_by(company,org) %>% 
+         top_n(10, total_commits), 
+       aes(x=reorder(org, total_commits), y=total_commits, fill=owned_repo)) +
+  geom_bar(stat="identity", position="stack") +
+  coord_flip() +
+  facet_wrap(~ company, scales="free", ncol=3) +
+  labs(title="Github Projects per Company with Most Commits", x="Github Project", y="Total Commits", fill="Own Repo?")
+
+```
+
+```{r fig-top-orgs-authors, fig.height=16, fig.width=10}
+
+# top significant repos per org if a huge list
+ggplot(owned_org_summary %>% 
+         filter(total_commits > 1, total_authors > 1) %>% 
+         group_by(company,org) %>% 
+         top_n(10, total_authors), 
+       aes(x=reorder(org, total_authors), y=total_authors, fill=owned_repo)) +
+  geom_bar(stat="identity", position="stack") +
+  coord_flip() +
+  facet_wrap(~ company, scales="free", ncol=3) +
+  labs(title="Github Projects per Company with Most Authors", x="Github Project", y="Total Authors", fill="Own Repo?")
+
+```
+
+```{r fig-top-orgs-authors-huawei}
+
+# top significant repos per org if a huge list
+ggplot(owned_org_summary %>% 
+         filter(company == "Huawei", total_commits > 1, total_authors > 1), 
+       aes(x=reorder(org, total_authors), y=total_authors, fill=owned_repo)) +
+  geom_bar(stat="identity", position="stack") +
+  coord_flip() +
+  labs(title="Github Projects with Huawei Authors", x="Github Project", y="Total Authors", fill="Own Repo?")
+
+```
+
+```{r fig-top-orgs-commits-huawei}
+
+# top significant repos per org if a huge list
+ggplot(owned_org_summary %>% 
+         filter(company == "Huawei", total_commits > 1, total_authors > 1),
+       aes(x=reorder(org, total_commits), y=total_commits, fill=owned_repo)) +
+  geom_bar(stat="identity", position="stack") +
+  coord_flip() +
+  labs(title="Github Projects with Huawei Authors", x="Github Project", y="Total Commits", fill="Own Repo?")
+
+```
+
 
 
 ### Individual Authors
@@ -424,7 +544,7 @@ Significance is defined as the presence of commits from multiple companies.
 
 Significance is defined as the presence of events from multiple companies.
 
-```{r significant_commits_multi_company}
+```{r significant_events_multi_company}
 
 ```
 
